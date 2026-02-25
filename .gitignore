@@ -12,3 +12,8 @@ Database/*.sqlite
 **/.jwt_key
 .git.backup
 *.zip
+
+# Firebase / Google servisleri
+**/google-services.json
+**/GoogleService-Info.plist
+**/*-credentials.json
