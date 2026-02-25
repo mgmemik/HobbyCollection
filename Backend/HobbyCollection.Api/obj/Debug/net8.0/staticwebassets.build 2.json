@@ -1,0 +1,11 @@
+{
+  "Version": 1,
+  "Hash": "3iB6pmp5JUdpVK78SWrGhHEn87mSLqwEFOu1LwOXdzE=",
+  "Source": "HobbyCollection.Api",
+  "BasePath": "_content/HobbyCollection.Api",
+  "Mode": "Default",
+  "ManifestType": "Build",
+  "ReferencedProjectsConfiguration": [],
+  "DiscoveryPatterns": [],
+  "Assets": []
+}

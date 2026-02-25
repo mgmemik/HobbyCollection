@@ -1,0 +1,30 @@
+{
+  "project_info": {
+    "project_number": "671634207118",
+    "project_id": "save-all-24f87",
+    "storage_bucket": "save-all-24f87.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:671634207118:android:c9746326a50736fefdb4df",
+        "android_client_info": {
+          "package_name": "com.gmemik.saveall"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCDlqWEsbEu3E1O9NoCihFxIVsBdTt46Gk"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
+

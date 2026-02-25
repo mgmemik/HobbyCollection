@@ -1,0 +1,1193 @@
+using Google.Cloud.Vision.V1;
+using HobbyCollection.Api.Models;
+using Microsoft.Extensions.Logging;
+using SixLabors.ImageSharp;
+using System.Text;
+
+namespace HobbyCollection.Api.Services
+{
+    public interface IPhotoAnalysisService
+    {
+        Task<PhotoAnalysisResult> AnalyzePhotosAsync(List<IFormFile> photos);
+    }
+
+    public class PhotoAnalysisService : IPhotoAnalysisService
+    {
+        private readonly ImageAnnotatorClient _visionClient;
+        private readonly ILogger<PhotoAnalysisService> _logger;
+
+        public PhotoAnalysisService(ILogger<PhotoAnalysisService> logger)
+        {
+            _logger = logger;
+            // Google Cloud credentials'ı environment variable'dan al
+            // GOOGLE_APPLICATION_CREDENTIALS environment variable'ı service account key dosyasının yolunu içermelidir
+            _visionClient = ImageAnnotatorClient.Create();
+        }
+
+        public async Task<PhotoAnalysisResult> AnalyzePhotosAsync(List<IFormFile> photos)
+        {
+            try
+            {
+                _logger.LogInformation("=== NORMAL ANALİZ BAŞLATILIYOR ===");
+                _logger.LogInformation($"Fotoğraf sayısı: {photos.Count}");
+
+                if (!photos.Any() || photos.Count > 10)
+                {
+                    throw new ArgumentException("1 ile 10 arasında fotoğraf gönderilmelidir.");
+                }
+
+                var allVisionData = new List<VisionAnalysisData>();
+
+                // Her fotoğraf için Vision API analizi yap
+                foreach (var photo in photos)
+                {
+                    _logger.LogInformation($"Fotoğraf analiz ediliyor: {photo.FileName}, Boyut: {photo.Length} bytes");
+                    var visionData = await AnalyzeSinglePhotoAsync(photo);
+                    allVisionData.Add(visionData);
+                    _logger.LogInformation($"Vision API sonuçları - Labels: {visionData.Labels?.Count ?? 0}, WebEntities: {visionData.WebEntities?.Count ?? 0}, Objects: {visionData.Objects?.Count ?? 0}, Text: {visionData.ExtractedText?.Length ?? 0} karakter");
+                }
+
+                _logger.LogInformation("Tüm Vision API analizleri tamamlandı, sonuçlar birleştiriliyor...");
+
+                // Tüm fotoğraflardan gelen verileri birleştir
+                var consolidatedResult = ConsolidateAnalysisResults(allVisionData);
+
+                _logger.LogInformation($"=== NORMAL ANALİZ TAMAMLANDI ===");
+                _logger.LogInformation($"Sonuç: {consolidatedResult.Title}, Confidence: {consolidatedResult.ConfidenceOverall}");
+
+                return consolidatedResult;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Fotoğraf analizi sırasında hata oluştu");
+                throw;
+            }
+        }
+
+        private async Task<VisionAnalysisData> AnalyzeSinglePhotoAsync(IFormFile photo)
+        {
+            try
+            {
+                _logger.LogInformation($"[SINGLE PHOTO] Vision API analizi başlatılıyor: {photo.FileName}");
+
+                // Fotoğrafı byte array'e dönüştür
+                byte[] imageBytes;
+                using (var memoryStream = new MemoryStream())
+                {
+                    await photo.CopyToAsync(memoryStream);
+                    imageBytes = memoryStream.ToArray();
+                }
+                _logger.LogInformation($"[SINGLE PHOTO] Görüntü byte array'e dönüştürüldü: {imageBytes.Length} bytes");
+
+                var image = Image.FromBytes(imageBytes);
+                _logger.LogInformation($"[SINGLE PHOTO] Vision API Image objesi oluşturuldu");
+
+                // Vision API isteklerini hazırla
+                var requests = new List<AnnotateImageRequest>
+                {
+                    new AnnotateImageRequest
+                    {
+                        Image = image,
+                        Features =
+                        {
+                            new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.LabelDetection, MaxResults = 50 },
+                            new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.WebDetection, MaxResults = 50 },
+                            new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.ObjectLocalization, MaxResults = 20 },
+                            new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.TextDetection, MaxResults = 20 },
+                            new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.LogoDetection, MaxResults = 10 },
+                            new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.ProductSearch, MaxResults = 10 },
+                            new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.SafeSearchDetection, MaxResults = 1 }
+                        }
+                    }
+                };
+
+                _logger.LogInformation($"[SINGLE PHOTO] Vision API istekleri hazırlandı - {requests.Count} istek");
+
+                // Vision API çağrısı
+                _logger.LogInformation($"[SINGLE PHOTO] Google Cloud Vision API çağrısı yapılıyor...");
+                var response = await _visionClient.BatchAnnotateImagesAsync(requests);
+
+                if (response.Responses.Count == 0)
+                {
+                    _logger.LogWarning($"[SINGLE PHOTO] Vision API'den yanıt alınamadı");
+                    return new VisionAnalysisData();
+                }
+
+                var annotation = response.Responses[0];
+
+                // Vision API error kontrolü
+                if (annotation.Error != null)
+                {
+                    _logger.LogWarning($"[SINGLE PHOTO] Vision API hatası: {annotation.Error.Code} - {annotation.Error.Message}");
+                    if (annotation.Error.Code == 3) // BAD_IMAGE_DATA
+                    {
+                        _logger.LogWarning($"[SINGLE PHOTO] Küçük veya bozuk fotoğraf algılandı, boş sonuç döndürülüyor");
+                    }
+                    return new VisionAnalysisData();
+                }
+
+                _logger.LogInformation($"[SINGLE PHOTO] Vision API yanıtı alındı. Response count: {response.Responses.Count}");
+
+                // Annotation sonuçlarını detaylı log'la
+                _logger.LogInformation($"[SINGLE PHOTO] Annotation sonuçları - Labels: {annotation.LabelAnnotations?.Count ?? 0}, WebEntities: {annotation.WebDetection?.WebEntities?.Count ?? 0}, Objects: {annotation.LocalizedObjectAnnotations?.Count ?? 0}, Texts: {annotation.TextAnnotations?.Count ?? 0}");
+
+                if (annotation.TextAnnotations?.Count > 0)
+                {
+                    var firstText = annotation.TextAnnotations[0];
+                    _logger.LogInformation($"[SINGLE PHOTO] İlk OCR metni: '{firstText.Description?.Substring(0, Math.Min(100, firstText.Description?.Length ?? 0)) ?? "null"}'");
+                }
+
+                // Gelişmiş veri çıkarma
+                var visionData = new VisionAnalysisData
+                {
+                    Labels = annotation.LabelAnnotations.Select(l => new LabelInfo
+                    {
+                        Description = l.Description,
+                        Score = l.Score
+                    }).ToList(),
+
+                    WebEntities = annotation.WebDetection?.WebEntities?.Select(w => new WebEntity
+                    {
+                        EntityId = w.EntityId ?? "",
+                        Description = w.Description ?? "",
+                        Score = w.Score
+                    }).ToList() ?? new List<WebEntity>(),
+
+                    Objects = annotation.LocalizedObjectAnnotations.Select(o => new ObjectInfo
+                    {
+                        Name = o.Name,
+                        Score = o.Score,
+                        BoundingBox = new BoundingBox
+                        {
+                            Vertices = o.BoundingPoly?.NormalizedVertices?.Select(v => new Vertex
+                            {
+                                X = v.X,
+                                Y = v.Y
+                            }).ToList() ?? new List<Vertex>()
+                        }
+                    }).ToList(),
+
+                    ExtractedText = annotation.TextAnnotations?.Count > 0 ?
+                        string.Join(" ", annotation.TextAnnotations.Select(t => t.Description)) : ""
+                };
+
+                _logger.LogInformation($"[SINGLE PHOTO] Vision API veri çıkarma tamamlandı");
+                _logger.LogInformation($"[SINGLE PHOTO] Labels: {visionData.Labels.Count}, WebEntities: {visionData.WebEntities.Count}, Objects: {visionData.Objects.Count}, ExtractedText: {visionData.ExtractedText.Length} karakter");
+
+                return visionData;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"[SINGLE PHOTO] Vision API analizi hatası: {photo.FileName}");
+                return new VisionAnalysisData();
+            }
+        }
+
+        /// <summary>
+        /// Tüm analiz sonuçlarını birleştirir
+        /// </summary>
+        private PhotoAnalysisResult ConsolidateAnalysisResults(List<VisionAnalysisData> visionDataList)
+        {
+            _logger.LogInformation("[CONSOLIDATE] Analiz sonuçları birleştiriliyor...");
+
+            if (!visionDataList.Any() || visionDataList.All(v => v.Labels.Count == 0))
+            {
+                _logger.LogWarning("[CONSOLIDATE] Hiç Vision API sonucu bulunamadı");
+                return new PhotoAnalysisResult
+                {
+                    Title = "Bilinmeyen Nesne",
+                    ConfidenceOverall = 0.0
+                };
+            }
+
+            // Tüm label'ları topla ve skorla
+            var allLabels = visionDataList
+                .SelectMany(v => v.Labels)
+                .GroupBy(l => l.Description)
+                .Select(g => new
+                {
+                    Description = g.Key,
+                    TotalScore = g.Sum(l => l.Score),
+                    Count = g.Count()
+                })
+                .OrderByDescending(l => l.TotalScore)
+                .ToList();
+
+            _logger.LogInformation($"[CONSOLIDATE] Toplam {allLabels.Count} farklı label bulundu");
+
+            // En iyi 5 label'ı log'la
+            foreach (var label in allLabels.Take(5))
+            {
+                _logger.LogInformation($"[CONSOLIDATE] Label: '{label.Description}', Score: {label.TotalScore:F3}, Count: {label.Count}");
+            }
+
+            // Title'ı belirle
+            var bestLabel = allLabels.FirstOrDefault();
+            var title = bestLabel?.Description ?? "Bilinmeyen Nesne";
+            _logger.LogInformation($"[CONSOLIDATE] Seçilen başlık: '{title}', Score: {bestLabel?.TotalScore:F3}");
+
+            // Confidence'ı hesapla
+            var maxScore = allLabels.Max(l => l.TotalScore);
+            var confidence = Math.Min(1.0, maxScore / 2.0); // Normalize et
+            _logger.LogInformation($"[CONSOLIDATE] Confidence hesaplandı: {confidence:F3} (maxScore: {maxScore:F3})");
+
+            // OCR metnini birleştir
+            var allOcrText = string.Join(" ", visionDataList
+                .Where(v => !string.IsNullOrEmpty(v.ExtractedText))
+                .Select(v => v.ExtractedText));
+
+            _logger.LogInformation($"[CONSOLIDATE] OCR metni: '{allOcrText.Substring(0, Math.Min(100, allOcrText.Length))}'");
+
+            var result = new PhotoAnalysisResult
+            {
+                Title = title,
+                DescriptionTr = allOcrText,
+                ConfidenceOverall = confidence,
+                Entities = allLabels.Take(10).Select(l => new DetectedEntity
+                {
+                    Name = l.Description,
+                    Type = "label",
+                    Confidence = l.TotalScore / Math.Max(1, l.Count)
+                }).ToList()
+            };
+
+            _logger.LogInformation($"[CONSOLIDATE] Birleştirme tamamlandı: {result.Title}, Confidence: {result.ConfidenceOverall:F3}");
+
+            return result;
+        }
+        }
+    }
+}
+
+                if (!photos.Any() || photos.Count > 10)
+                {
+                    throw new ArgumentException("1 ile 10 arasında fotoğraf gönderilmelidir.");
+                }
+
+                var allVisionData = new List<VisionAnalysisData>();
+
+                // Her fotoğraf için Vision API analizi yap
+                foreach (var photo in photos)
+                {
+                    _logger.LogInformation($"Fotoğraf analiz ediliyor: {photo.FileName}, Boyut: {photo.Length} bytes");
+                    var visionData = await AnalyzeSinglePhotoAsync(photo);
+                    allVisionData.Add(visionData);
+                    _logger.LogInformation($"Vision API sonuçları - Labels: {visionData.Labels?.Count ?? 0}, WebEntities: {visionData.WebEntities?.Count ?? 0}, Objects: {visionData.Objects?.Count ?? 0}, Text: {visionData.ExtractedText?.Length ?? 0} karakter");
+                }
+
+                _logger.LogInformation("Tüm Vision API analizleri tamamlandı, sonuçlar birleştiriliyor...");
+
+                // Tüm fotoğraflardan gelen verileri birleştir
+                var consolidatedResult = ConsolidateAnalysisResults(allVisionData);
+
+                _logger.LogInformation($"=== NORMAL ANALİZ TAMAMLANDI ===");
+                _logger.LogInformation($"Sonuç: {consolidatedResult.Title}, Confidence: {consolidatedResult.ConfidenceOverall}");
+
+                return consolidatedResult;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Fotoğraf analizi sırasında hata oluştu");
+                throw;
+            }
+        }
+
+        private async Task<VisionAnalysisData> AnalyzeSinglePhotoAsync(IFormFile photo)
+        {
+            try
+            {
+                _logger.LogInformation($"[SINGLE PHOTO] Vision API analizi başlatılıyor: {photo.FileName}");
+
+                // Fotoğrafı byte array'e dönüştür
+                byte[] imageBytes;
+                using (var memoryStream = new MemoryStream())
+                {
+                    await photo.CopyToAsync(memoryStream);
+                    imageBytes = memoryStream.ToArray();
+                }
+                _logger.LogInformation($"[SINGLE PHOTO] Görüntü byte array'e dönüştürüldü: {imageBytes.Length} bytes");
+
+                var image = Image.FromBytes(imageBytes);
+                _logger.LogInformation($"[SINGLE PHOTO] Vision API Image objesi oluşturuldu");
+
+                // Vision API isteklerini hazırla
+                var requests = new List<AnnotateImageRequest>
+                {
+                    new AnnotateImageRequest
+                    {
+                        Image = image,
+                        Features =
+                        {
+                            new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.LabelDetection, MaxResults = 50 },
+                            new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.WebDetection, MaxResults = 50 },
+                            new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.ObjectLocalization, MaxResults = 20 },
+                            new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.TextDetection, MaxResults = 20 },
+                            new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.LogoDetection, MaxResults = 10 },
+                            new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.ProductSearch, MaxResults = 10 },
+                            new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.SafeSearchDetection, MaxResults = 1 }
+                        }
+                    }
+                };
+
+                _logger.LogInformation($"[SINGLE PHOTO] Vision API istekleri hazırlandı - {requests.Count} istek");
+
+                // Vision API çağrısı
+                _logger.LogInformation($"[SINGLE PHOTO] Google Cloud Vision API çağrısı yapılıyor...");
+                var response = await _visionClient.BatchAnnotateImagesAsync(requests);
+
+                if (response.Responses.Count == 0)
+                {
+                    _logger.LogWarning($"[SINGLE PHOTO] Vision API'den yanıt alınamadı");
+                    return new VisionAnalysisData();
+                }
+
+                var annotation = response.Responses[0];
+
+                // Vision API error kontrolü
+                if (annotation.Error != null)
+                {
+                    _logger.LogWarning($"[SINGLE PHOTO] Vision API hatası: {annotation.Error.Code} - {annotation.Error.Message}");
+                    if (annotation.Error.Code == 3) // BAD_IMAGE_DATA
+                    {
+                        _logger.LogWarning($"[SINGLE PHOTO] Küçük veya bozuk fotoğraf algılandı, boş sonuç döndürülüyor");
+                    }
+                    return new VisionAnalysisData();
+                }
+
+                _logger.LogInformation($"[SINGLE PHOTO] Vision API yanıtı alındı. Response count: {response.Responses.Count}");
+
+                // Annotation sonuçlarını detaylı log'la
+                _logger.LogInformation($"[SINGLE PHOTO] Annotation sonuçları - Labels: {annotation.LabelAnnotations?.Count ?? 0}, WebEntities: {annotation.WebDetection?.WebEntities?.Count ?? 0}, Objects: {annotation.LocalizedObjectAnnotations?.Count ?? 0}, Texts: {annotation.TextAnnotations?.Count ?? 0}");
+
+                if (annotation.TextAnnotations?.Count > 0)
+                {
+                    var firstText = annotation.TextAnnotations[0];
+                    _logger.LogInformation($"[SINGLE PHOTO] İlk OCR metni: '{firstText.Description?.Substring(0, Math.Min(100, firstText.Description?.Length ?? 0)) ?? "null"}'");
+                }
+
+                // Gelişmiş veri çıkarma
+                var visionData = new VisionAnalysisData
+                {
+                    Labels = annotation.LabelAnnotations.Select(l => new LabelInfo
+                    {
+                        Description = l.Description,
+                        Score = l.Score
+                    }).ToList(),
+
+                    WebEntities = annotation.WebDetection?.WebEntities?.Select(w => new WebEntity
+                    {
+                        EntityId = w.EntityId ?? "",
+                        Description = w.Description ?? "",
+                        Score = w.Score
+                    }).ToList() ?? new List<WebEntity>(),
+
+                    Objects = annotation.LocalizedObjectAnnotations.Select(o => new ObjectInfo
+                    {
+                        Name = o.Name,
+                        Score = o.Score,
+                        BoundingBox = new BoundingBox
+                        {
+                            Vertices = o.BoundingPoly?.NormalizedVertices?.Select(v => new Vertex
+                            {
+                                X = v.X,
+                                Y = v.Y
+                            }).ToList() ?? new List<Vertex>()
+                        }
+                    }).ToList(),
+
+                    ExtractedText = annotation.TextAnnotations?.Count > 0 ?
+                        string.Join(" ", annotation.TextAnnotations.Select(t => t.Description)) : ""
+                };
+
+                _logger.LogInformation($"[SINGLE PHOTO] Vision API veri çıkarma tamamlandı");
+                _logger.LogInformation($"[SINGLE PHOTO] Labels: {visionData.Labels.Count}, WebEntities: {visionData.WebEntities.Count}, Objects: {visionData.Objects.Count}, ExtractedText: {visionData.ExtractedText.Length} karakter");
+
+                return visionData;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"[SINGLE PHOTO] Vision API analizi hatası: {photo.FileName}");
+                return new VisionAnalysisData();
+            }
+        }
+
+        /// <summary>
+        /// Tüm analiz sonuçlarını birleştirir
+        /// </summary>
+        private PhotoAnalysisResult ConsolidateAnalysisResults(List<VisionAnalysisData> visionDataList)
+        {
+            _logger.LogInformation("[CONSOLIDATE] Analiz sonuçları birleştiriliyor...");
+
+            if (!visionDataList.Any() || visionDataList.All(v => v.Labels.Count == 0))
+            {
+                _logger.LogWarning("[CONSOLIDATE] Hiç Vision API sonucu bulunamadı");
+                return new PhotoAnalysisResult
+                {
+                    Title = "Bilinmeyen Nesne",
+                    ConfidenceOverall = 0.0
+                };
+            }
+
+            // Tüm label'ları topla ve skorla
+            var allLabels = visionDataList
+                .SelectMany(v => v.Labels)
+                .GroupBy(l => l.Description)
+                .Select(g => new
+                {
+                    Description = g.Key,
+                    TotalScore = g.Sum(l => l.Score),
+                    Count = g.Count()
+                })
+                .OrderByDescending(l => l.TotalScore)
+                .ToList();
+
+            _logger.LogInformation($"[CONSOLIDATE] Toplam {allLabels.Count} farklı label bulundu");
+
+            // En iyi 5 label'ı log'la
+            foreach (var label in allLabels.Take(5))
+            {
+                _logger.LogInformation($"[CONSOLIDATE] Label: '{label.Description}', Score: {label.TotalScore:F3}, Count: {label.Count}");
+            }
+
+            // Title'ı belirle
+            var bestLabel = allLabels.FirstOrDefault();
+            var title = bestLabel?.Description ?? "Bilinmeyen Nesne";
+            _logger.LogInformation($"[CONSOLIDATE] Seçilen başlık: '{title}', Score: {bestLabel?.TotalScore:F3}");
+
+            // Confidence'ı hesapla
+            var maxScore = allLabels.Max(l => l.TotalScore);
+            var confidence = Math.Min(1.0, maxScore / 2.0); // Normalize et
+            _logger.LogInformation($"[CONSOLIDATE] Confidence hesaplandı: {confidence:F3} (maxScore: {maxScore:F3})");
+
+            // OCR metnini birleştir
+            var allOcrText = string.Join(" ", visionDataList
+                .Where(v => !string.IsNullOrEmpty(v.ExtractedText))
+                .Select(v => v.ExtractedText));
+
+            _logger.LogInformation($"[CONSOLIDATE] OCR metni: '{allOcrText.Substring(0, Math.Min(100, allOcrText.Length))}'");
+
+            var result = new PhotoAnalysisResult
+            {
+                Title = title,
+                DescriptionTr = allOcrText,
+                ConfidenceOverall = confidence,
+                Entities = allLabels.Take(10).Select(l => new DetectedEntity
+                {
+                    Name = l.Description,
+                    Type = "label",
+                    Confidence = l.TotalScore / Math.Max(1, l.Count)
+                }).ToList()
+            };
+
+            _logger.LogInformation($"[CONSOLIDATE] Birleştirme tamamlandı: {result.Title}, Confidence: {result.ConfidenceOverall:F3}");
+
+            return result;
+        }
+    }
+}
+
+                if (!photos.Any() || photos.Count > 10)
+                {
+                    throw new ArgumentException("1 ile 10 arasında fotoğraf gönderilmelidir.");
+                }
+
+                var allVisionData = new List<VisionAnalysisData>();
+
+                // Her fotoğraf için Vision API analizi yap
+                foreach (var photo in photos)
+                {
+                    _logger.LogInformation($"Fotoğraf analiz ediliyor: {photo.FileName}, Boyut: {photo.Length} bytes");
+                    var visionData = await AnalyzeSinglePhotoAsync(photo);
+                    allVisionData.Add(visionData);
+                    _logger.LogInformation($"Vision API sonuçları - Labels: {visionData.Labels?.Count ?? 0}, WebEntities: {visionData.WebEntities?.Count ?? 0}, Objects: {visionData.Objects?.Count ?? 0}, Text: {visionData.ExtractedText?.Length ?? 0} karakter");
+                }
+
+                _logger.LogInformation("Tüm Vision API analizleri tamamlandı, sonuçlar birleştiriliyor...");
+
+                // Tüm fotoğraflardan gelen verileri birleştir
+                var consolidatedResult = ConsolidateAnalysisResults(allVisionData);
+
+                _logger.LogInformation($"=== NORMAL ANALİZ TAMAMLANDI ===");
+                _logger.LogInformation($"Sonuç: {consolidatedResult.Title}, Confidence: {consolidatedResult.ConfidenceOverall}");
+
+                return consolidatedResult;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Fotoğraf analizi sırasında hata oluştu");
+                throw;
+            }
+        }
+
+        private async Task<VisionAnalysisData> AnalyzeSinglePhotoAsync(IFormFile photo)
+        {
+            try
+            {
+                _logger.LogInformation($"[SINGLE PHOTO] Vision API analizi başlatılıyor: {photo.FileName}");
+
+                // Fotoğrafı byte array'e dönüştür
+                byte[] imageBytes;
+                using (var memoryStream = new MemoryStream())
+                {
+                    await photo.CopyToAsync(memoryStream);
+                    imageBytes = memoryStream.ToArray();
+                }
+                _logger.LogInformation($"[SINGLE PHOTO] Görüntü byte array'e dönüştürüldü: {imageBytes.Length} bytes");
+
+                var image = Image.FromBytes(imageBytes);
+                _logger.LogInformation($"[SINGLE PHOTO] Vision API Image objesi oluşturuldu");
+
+                // Vision API isteklerini hazırla
+                var requests = new List<AnnotateImageRequest>
+                {
+                    new AnnotateImageRequest
+                    {
+                        Image = image,
+                        Features =
+                        {
+                            new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.LabelDetection, MaxResults = 50 },
+                            new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.WebDetection, MaxResults = 50 },
+                            new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.ObjectLocalization, MaxResults = 20 },
+                            new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.TextDetection, MaxResults = 20 },
+                            new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.LogoDetection, MaxResults = 10 },
+                            new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.ProductSearch, MaxResults = 10 },
+                            new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.SafeSearchDetection, MaxResults = 1 }
+                        }
+                    }
+                };
+
+                _logger.LogInformation($"[SINGLE PHOTO] Vision API istekleri hazırlandı - {requests.Count} istek");
+
+                // Vision API çağrısı
+                _logger.LogInformation($"[SINGLE PHOTO] Google Cloud Vision API çağrısı yapılıyor...");
+                var response = await _visionClient.BatchAnnotateImagesAsync(requests);
+
+                if (response.Responses.Count == 0)
+                {
+                    _logger.LogWarning($"[SINGLE PHOTO] Vision API'den yanıt alınamadı");
+                    return new VisionAnalysisData();
+                }
+
+                var annotation = response.Responses[0];
+
+                // Vision API error kontrolü
+                if (annotation.Error != null)
+                {
+                    _logger.LogWarning($"[SINGLE PHOTO] Vision API hatası: {annotation.Error.Code} - {annotation.Error.Message}");
+                    if (annotation.Error.Code == 3) // BAD_IMAGE_DATA
+                    {
+                        _logger.LogWarning($"[SINGLE PHOTO] Küçük veya bozuk fotoğraf algılandı, boş sonuç döndürülüyor");
+                    }
+                    return new VisionAnalysisData();
+                }
+
+                _logger.LogInformation($"[SINGLE PHOTO] Vision API yanıtı alındı. Response count: {response.Responses.Count}");
+
+                // Annotation sonuçlarını detaylı log'la
+                _logger.LogInformation($"[SINGLE PHOTO] Annotation sonuçları - Labels: {annotation.LabelAnnotations?.Count ?? 0}, WebEntities: {annotation.WebDetection?.WebEntities?.Count ?? 0}, Objects: {annotation.LocalizedObjectAnnotations?.Count ?? 0}, Texts: {annotation.TextAnnotations?.Count ?? 0}");
+
+                if (annotation.TextAnnotations?.Count > 0)
+                {
+                    var firstText = annotation.TextAnnotations[0];
+                    _logger.LogInformation($"[SINGLE PHOTO] İlk OCR metni: '{firstText.Description?.Substring(0, Math.Min(100, firstText.Description?.Length ?? 0)) ?? "null"}'");
+                }
+
+                // Gelişmiş veri çıkarma
+                var visionData = new VisionAnalysisData
+                {
+                    Labels = annotation.LabelAnnotations.Select(l => new LabelInfo
+                    {
+                        Description = l.Description,
+                        Score = l.Score
+                    }).ToList(),
+
+                    WebEntities = annotation.WebDetection?.WebEntities?.Select(w => new WebEntity
+                    {
+                        EntityId = w.EntityId ?? "",
+                        Description = w.Description ?? "",
+                        Score = w.Score
+                    }).ToList() ?? new List<WebEntity>(),
+
+                    Objects = annotation.LocalizedObjectAnnotations.Select(o => new ObjectInfo
+                    {
+                        Name = o.Name,
+                        Score = o.Score,
+                        BoundingBox = new BoundingBox
+                        {
+                            Vertices = o.BoundingPoly?.NormalizedVertices?.Select(v => new Vertex
+                            {
+                                X = v.X,
+                                Y = v.Y
+                            }).ToList() ?? new List<Vertex>()
+                        }
+                    }).ToList(),
+
+                    ExtractedText = annotation.TextAnnotations?.Count > 0 ?
+                        string.Join(" ", annotation.TextAnnotations.Select(t => t.Description)) : ""
+                };
+
+                _logger.LogInformation($"[SINGLE PHOTO] Vision API veri çıkarma tamamlandı");
+                _logger.LogInformation($"[SINGLE PHOTO] Labels: {visionData.Labels.Count}, WebEntities: {visionData.WebEntities.Count}, Objects: {visionData.Objects.Count}, ExtractedText: {visionData.ExtractedText.Length} karakter");
+
+                return visionData;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"[SINGLE PHOTO] Vision API analizi hatası: {photo.FileName}");
+                return new VisionAnalysisData();
+            }
+        }
+
+        /// <summary>
+        /// Tüm analiz sonuçlarını birleştirir
+        /// </summary>
+        private PhotoAnalysisResult ConsolidateAnalysisResults(List<VisionAnalysisData> visionDataList)
+        {
+            _logger.LogInformation("[CONSOLIDATE] Analiz sonuçları birleştiriliyor...");
+
+            if (!visionDataList.Any() || visionDataList.All(v => v.Labels.Count == 0))
+            {
+                _logger.LogWarning("[CONSOLIDATE] Hiç Vision API sonucu bulunamadı");
+                return new PhotoAnalysisResult
+                {
+                    Title = "Bilinmeyen Nesne",
+                    ConfidenceOverall = 0.0
+                };
+            }
+
+            // Tüm label'ları topla ve skorla
+            var allLabels = visionDataList
+                .SelectMany(v => v.Labels)
+                .GroupBy(l => l.Description)
+                .Select(g => new
+                {
+                    Description = g.Key,
+                    TotalScore = g.Sum(l => l.Score),
+                    Count = g.Count()
+                })
+                .OrderByDescending(l => l.TotalScore)
+                .ToList();
+
+            _logger.LogInformation($"[CONSOLIDATE] Toplam {allLabels.Count} farklı label bulundu");
+
+            // En iyi 5 label'ı log'la
+            foreach (var label in allLabels.Take(5))
+            {
+                _logger.LogInformation($"[CONSOLIDATE] Label: '{label.Description}', Score: {label.TotalScore:F3}, Count: {label.Count}");
+            }
+
+            // Title'ı belirle
+            var bestLabel = allLabels.FirstOrDefault();
+            var title = bestLabel?.Description ?? "Bilinmeyen Nesne";
+            _logger.LogInformation($"[CONSOLIDATE] Seçilen başlık: '{title}', Score: {bestLabel?.TotalScore:F3}");
+
+            // Confidence'ı hesapla
+            var maxScore = allLabels.Max(l => l.TotalScore);
+            var confidence = Math.Min(1.0, maxScore / 2.0); // Normalize et
+            _logger.LogInformation($"[CONSOLIDATE] Confidence hesaplandı: {confidence:F3} (maxScore: {maxScore:F3})");
+
+            // OCR metnini birleştir
+            var allOcrText = string.Join(" ", visionDataList
+                .Where(v => !string.IsNullOrEmpty(v.ExtractedText))
+                .Select(v => v.ExtractedText));
+
+            _logger.LogInformation($"[CONSOLIDATE] OCR metni: '{allOcrText.Substring(0, Math.Min(100, allOcrText.Length))}'");
+
+            var result = new PhotoAnalysisResult
+            {
+                Title = title,
+                DescriptionTr = allOcrText,
+                ConfidenceOverall = confidence,
+                Entities = allLabels.Take(10).Select(l => new DetectedEntity
+                {
+                    Name = l.Description,
+                    Type = "label",
+                    Confidence = l.TotalScore / Math.Max(1, l.Count)
+                }).ToList()
+            };
+
+            _logger.LogInformation($"[CONSOLIDATE] Birleştirme tamamlandı: {result.Title}, Confidence: {result.ConfidenceOverall:F3}");
+
+            return result;
+        }
+    }
+}
+
+}
+
+            var allVisionData = new List<VisionAnalysisData>();
+
+            // Her fotoğraf için Vision API analizi yap
+            foreach (var photo in photos)
+            {
+                _logger.LogInformation($"Fotoğraf analiz ediliyor: {photo.FileName}, Boyut: {photo.Length} bytes");
+                var visionData = await AnalyzeSinglePhotoAsync(photo);
+                allVisionData.Add(visionData);
+                _logger.LogInformation($"Vision API sonuçları - Labels: {visionData.Labels?.Count ?? 0}, WebEntities: {visionData.WebEntities?.Count ?? 0}, Objects: {visionData.Objects?.Count ?? 0}, Text: {visionData.ExtractedText?.Length ?? 0} karakter");
+            }
+
+            _logger.LogInformation("Tüm Vision API analizleri tamamlandı, sonuçlar birleştiriliyor...");
+
+            // Tüm fotoğraflardan gelen verileri birleştir
+            var consolidatedResult = ConsolidateAnalysisResults(allVisionData);
+
+            _logger.LogInformation($"=== NORMAL ANALİZ TAMAMLANDI ===");
+            _logger.LogInformation($"Sonuç: {consolidatedResult.Title}, Confidence: {consolidatedResult.ConfidenceOverall}");
+
+            return consolidatedResult;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Fotoğraf analizi sırasında hata oluştu");
+            throw;
+        }
+    }
+
+    private async Task<VisionAnalysisData> AnalyzeSinglePhotoAsync(IFormFile photo)
+    {
+        try
+        {
+            _logger.LogInformation($"[SINGLE PHOTO] Vision API analizi başlatılıyor: {photo.FileName}");
+
+            // Fotoğrafı byte array'e dönüştür
+            byte[] imageBytes;
+            using (var memoryStream = new MemoryStream())
+            {
+                await photo.CopyToAsync(memoryStream);
+                imageBytes = memoryStream.ToArray();
+            }
+            _logger.LogInformation($"[SINGLE PHOTO] Görüntü byte array'e dönüştürüldü: {imageBytes.Length} bytes");
+
+            // Vision API çağrısı
+            _logger.LogInformation($"[SINGLE PHOTO] Google Cloud Vision API çağrısı yapılıyor...");
+            var response = await _visionClient.BatchAnnotateImagesAsync(requests);
+
+            if (response.Responses.Count == 0)
+            {
+                _logger.LogWarning($"[SINGLE PHOTO] Vision API'den yanıt alınamadı");
+                return new VisionAnalysisData();
+            }
+
+            var annotation = response.Responses[0];
+
+            // Vision API error kontrolü
+            if (annotation.Error != null)
+            {
+                _logger.LogWarning($"[SINGLE PHOTO] Vision API hatası: {annotation.Error.Code} - {annotation.Error.Message}");
+                if (annotation.Error.Code == 3) // BAD_IMAGE_DATA
+                {
+                    _logger.LogWarning($"[SINGLE PHOTO] Küçük veya bozuk fotoğraf algılandı, boş sonuç döndürülüyor");
+                }
+                return new VisionAnalysisData();
+            }
+
+            _logger.LogInformation($"[SINGLE PHOTO] Vision API yanıtı alındı. Response count: {response.Responses.Count}");
+
+            // Annotation sonuçlarını detaylı log'la
+            _logger.LogInformation($"[SINGLE PHOTO] Annotation sonuçları - Labels: {annotation.LabelAnnotations?.Count ?? 0}, WebEntities: {annotation.WebDetection?.WebEntities?.Count ?? 0}, Objects: {annotation.LocalizedObjectAnnotations?.Count ?? 0}, Texts: {annotation.TextAnnotations?.Count ?? 0}");
+
+            if (annotation.TextAnnotations?.Count > 0)
+            {
+                var firstText = annotation.TextAnnotations[0];
+                _logger.LogInformation($"[SINGLE PHOTO] İlk OCR metni: '{firstText.Description?.Substring(0, Math.Min(100, firstText.Description?.Length ?? 0)) ?? "null"}'");
+            }
+
+            var image = Image.FromBytes(imageBytes);
+            _logger.LogInformation($"[SINGLE PHOTO] Vision API Image objesi oluşturuldu");
+
+            // Vision API isteklerini hazırla
+            var requests = new List<AnnotateImageRequest>
+            {
+                new AnnotateImageRequest
+                {
+                    Image = image,
+                    Features =
+                    {
+                        new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.LabelDetection, MaxResults = 50 },
+                        new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.WebDetection, MaxResults = 50 },
+                        new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.ObjectLocalization, MaxResults = 20 },
+                        new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.TextDetection, MaxResults = 20 },
+                        new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.LogoDetection, MaxResults = 10 },
+                        new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.ProductSearch, MaxResults = 10 },
+                        new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.SafeSearchDetection, MaxResults = 1 }
+                    }
+                }
+            };
+
+            _logger.LogInformation($"[SINGLE PHOTO] Vision API istekleri hazırlandı - {requests.Count} istek");
+
+            // Vision API çağrısı
+            _logger.LogInformation($"[SINGLE PHOTO] Google Cloud Vision API çağrısı yapılıyor...");
+            var response = await _visionClient.BatchAnnotateImagesAsync(requests);
+
+            if (response.Responses.Count == 0)
+            {
+                _logger.LogWarning($"[SINGLE PHOTO] Vision API'den yanıt alınamadı");
+                return new VisionAnalysisData();
+            }
+
+            var annotation = response.Responses[0];
+
+            // Vision API error kontrolü
+            if (annotation.Error != null)
+            {
+                _logger.LogWarning($"[SINGLE PHOTO] Vision API hatası: {annotation.Error.Code} - {annotation.Error.Message}");
+                if (annotation.Error.Code == 3) // BAD_IMAGE_DATA
+                {
+                    _logger.LogWarning($"[SINGLE PHOTO] Küçük veya bozuk fotoğraf algılandı, boş sonuç döndürülüyor");
+                }
+                return new VisionAnalysisData();
+            }
+
+            _logger.LogInformation($"[SINGLE PHOTO] Vision API yanıtı alındı. Response count: {response.Responses.Count}");
+
+            // Annotation sonuçlarını detaylı log'la
+            _logger.LogInformation($"[SINGLE PHOTO] Annotation sonuçları - Labels: {annotation.LabelAnnotations?.Count ?? 0}, WebEntities: {annotation.WebDetection?.WebEntities?.Count ?? 0}, Objects: {annotation.LocalizedObjectAnnotations?.Count ?? 0}, Texts: {annotation.TextAnnotations?.Count ?? 0}");
+
+            if (annotation.TextAnnotations?.Count > 0)
+            {
+                var firstText = annotation.TextAnnotations[0];
+                _logger.LogInformation($"[SINGLE PHOTO] İlk OCR metni: '{firstText.Description?.Substring(0, Math.Min(100, firstText.Description?.Length ?? 0)) ?? "null"}'");
+            }
+
+            // Gelişmiş veri çıkarma
+            var visionData = new VisionAnalysisData
+            {
+                Labels = annotation.LabelAnnotations.Select(l => new LabelInfo
+                {
+                    Description = l.Description,
+                    Score = l.Score
+                }).ToList(),
+
+                WebEntities = annotation.WebDetection?.WebEntities?.Select(w => new WebEntity
+                {
+                    EntityId = w.EntityId ?? "",
+                    Description = w.Description ?? "",
+                    Score = w.Score
+                }).ToList() ?? new List<WebEntity>(),
+
+                Objects = annotation.LocalizedObjectAnnotations.Select(o => new ObjectInfo
+                {
+                    Name = o.Name,
+                    Score = o.Score,
+                    BoundingBox = new BoundingBox
+                    {
+                        Vertices = o.BoundingPoly?.NormalizedVertices?.Select(v => new Vertex
+                        {
+                            X = v.X,
+                            Y = v.Y
+                        }).ToList() ?? new List<Vertex>()
+                    }
+                }).ToList(),
+
+                ExtractedText = annotation.TextAnnotations?.Count > 0 ?
+                    string.Join(" ", annotation.TextAnnotations.Select(t => t.Description)) : ""
+            };
+
+            _logger.LogInformation($"[SINGLE PHOTO] Vision API veri çıkarma tamamlandı");
+            _logger.LogInformation($"[SINGLE PHOTO] Labels: {visionData.Labels.Count}, WebEntities: {visionData.WebEntities.Count}, Objects: {visionData.Objects.Count}, ExtractedText: {visionData.ExtractedText.Length} karakter");
+
+            return visionData;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, $"[SINGLE PHOTO] Vision API analizi hatası: {photo.FileName}");
+            return new VisionAnalysisData();
+        }
+    }
+
+            _logger.LogInformation($"Annotation sonuçları - Labels: {annotation.LabelAnnotations.Count}, WebEntities: {annotation.WebDetection?.WebEntities?.Count ?? 0}, Objects: {annotation.LocalizedObjectAnnotations.Count}, Texts: {annotation.TextAnnotations.Count}");
+
+            if (annotation.Error != null)
+            {
+                _logger.LogError($"Vision API hatası: {annotation.Error.Code} - {annotation.Error.Message}");
+            }
+
+            var visionData = new VisionAnalysisData
+            {
+                Labels = annotation.LabelAnnotations.Select(l => new LabelInfo
+                {
+                    Description = l.Description,
+                    Score = l.Score
+                }).ToList(),
+
+                WebEntities = annotation.WebDetection?.WebEntities?.Select(w => new WebEntity
+                {
+                    EntityId = w.EntityId ?? "",
+                    Description = w.Description ?? "",
+                    Score = w.Score
+                }).ToList() ?? new List<WebEntity>(),
+
+                Objects = annotation.LocalizedObjectAnnotations.Select(o => new ObjectInfo
+                {
+                    Name = o.Name,
+                    Score = o.Score,
+                    BoundingBox = new BoundingBox
+                    {
+                        Vertices = o.BoundingPoly.Vertices.Select(v => new Models.Vertex
+                        {
+                            X = v.X,
+                            Y = v.Y
+                        }).ToList()
+                    }
+                }).ToList(),
+
+                ExtractedText = string.Join(" ", annotation.TextAnnotations.Select(t => t.Description))
+            };
+
+            return visionData;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, $"Tek fotoğraf analizi hatası: {photo.FileName}");
+            throw;
+        }
+    }
+
+    private PhotoAnalysisResult ConsolidateAnalysisResults(List<VisionAnalysisData> allVisionData)
+    {
+        // Şimdilik basit bir konsolidasyon - ilk fotoğrafın verilerini kullan
+        // Daha sonra çoklu fotoğraf için geliştirebiliriz
+        var primaryVisionData = allVisionData.First();
+
+        // En yüksek skorlu label'ları al
+        var topLabels = primaryVisionData.Labels
+            .OrderByDescending(l => l.Score)
+            .Take(5)
+            .ToList();
+
+        // En yüksek skorlu web entities'leri al
+        var topWebEntities = primaryVisionData.WebEntities
+            .Where(w => !string.IsNullOrEmpty(w.Description))
+            .OrderByDescending(w => w.Score)
+            .Take(5)
+            .ToList();
+
+        // Basit bir başlık oluştur
+        var title = GenerateTitle(topLabels, topWebEntities, primaryVisionData.ExtractedText);
+
+        // Hashtag'ler oluştur
+        var hashtags = GenerateHashtags(topLabels, topWebEntities);
+
+        // Entities oluştur
+        var entities = GenerateEntities(topLabels, topWebEntities);
+
+        // Genel güven skoru hesapla
+        var averageConfidence = topLabels.Any() ? topLabels.Average(l => l.Score) : 0.0;
+
+        var result = new PhotoAnalysisResult
+        {
+            Title = title,
+            DescriptionTr = GenerateDescriptionTr(topLabels, topWebEntities, primaryVisionData.ExtractedText),
+            DescriptionEn = GenerateDescriptionEn(topLabels, topWebEntities, primaryVisionData.ExtractedText),
+            Hashtags = hashtags,
+            Entities = entities,
+            Period = DeterminePeriod(topLabels, topWebEntities),
+            Materials = DetermineMaterials(topLabels),
+            Condition = "bilinmiyor", // Şimdilik sabit
+            Rarity = "bilinmiyor", // Şimdilik sabit
+            ConfidenceOverall = averageConfidence,
+            Evidence = GenerateEvidence(topLabels, topWebEntities, primaryVisionData.ExtractedText),
+            VisionData = primaryVisionData
+        };
+
+        return result;
+    }
+
+    private string GenerateTitle(List<LabelInfo> labels, List<WebEntity> webEntities, string extractedText)
+    {
+        // Önce web entities'den marka/model bilgisi ara
+        var brandInfo = webEntities.FirstOrDefault(w => w.Score > 0.7);
+        if (brandInfo != null && !string.IsNullOrEmpty(brandInfo.Description))
+        {
+            return brandInfo.Description;
+        }
+
+        // OCR'dan marka/model bilgisi ara
+        if (!string.IsNullOrEmpty(extractedText))
+        {
+            var words = extractedText.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (words.Length > 0)
+            {
+                return string.Join(" ", words.Take(3)); // İlk 3 kelimeyi al
+            }
+        }
+
+        // En yüksek skorlu label'ı kullan
+        var topLabel = labels.FirstOrDefault();
+        return topLabel?.Description ?? "Bilinmeyen Nesne";
+    }
+
+    private List<string> GenerateHashtags(List<LabelInfo> labels, List<WebEntity> webEntities)
+    {
+        var hashtags = new List<string>();
+
+        // Label'lardan hashtag'ler oluştur
+        foreach (var label in labels.Take(6))
+        {
+            if (label.Score > 0.6)
+            {
+                hashtags.Add($"#{label.Description.Replace(" ", "")}");
+            }
+        }
+
+        // Web entities'den hashtag'ler oluştur
+        foreach (var entity in webEntities.Take(3))
+        {
+            if (entity.Score > 0.7 && !string.IsNullOrEmpty(entity.Description))
+            {
+                hashtags.Add($"#{entity.Description.Replace(" ", "")}");
+            }
+        }
+
+        // Genel hashtag'ler ekle
+        hashtags.AddRange(new[] { "#koleksiyon", "#antika", "#vintage" });
+
+        return hashtags.Distinct().Take(12).ToList();
+    }
+
+    private List<DetectedEntity> GenerateEntities(List<LabelInfo> labels, List<WebEntity> webEntities)
+    {
+        var entities = new List<DetectedEntity>();
+
+        // Label'lardan entities oluştur
+        foreach (var label in labels.Take(3))
+        {
+            entities.Add(new DetectedEntity
+            {
+                Name = label.Description,
+                Type = "category",
+                Confidence = label.Score
+            });
+        }
+
+        // Web entities'den marka bilgileri al
+        foreach (var webEntity in webEntities.Take(2))
+        {
+            if (webEntity.Score > 0.7)
+            {
+                entities.Add(new DetectedEntity
+                {
+                    Name = webEntity.Description,
+                    Type = "brand_or_model",
+                    Confidence = webEntity.Score
+                });
+            }
+        }
+
+        return entities;
+    }
+
+    private string GenerateDescriptionTr(List<LabelInfo> labels, List<WebEntity> webEntities, string extractedText)
+    {
+        var sb = new StringBuilder();
+        // Başta "Bu nesne" kalıbını kullanmadan, doğrudan tanımlayıcı bir ifade üret
+        if (labels.Any())
+        {
+            var core = string.Join(", ", labels
+                .Take(3)
+                .Select(l => l.Description.ToLower()));
+            sb.Append($"{core} ile ilişkili, koleksiyonluk bir öğe. ");
+        }
+
+        if (!string.IsNullOrEmpty(extractedText))
+        {
+            var snippet = extractedText.Replace("\n", " ");
+            snippet = snippet.Substring(0, Math.Min(100, snippet.Length));
+            sb.Append($"Üzerindeki yazı: {snippet}. ");
+        }
+
+        return sb.ToString().Trim();
+    }
+
+    private string GenerateDescriptionEn(List<LabelInfo> labels, List<WebEntity> webEntities, string extractedText)
+    {
+        var sb = new StringBuilder();
+        if (labels.Any())
+        {
+            var core = string.Join(", ", labels
+                .Take(3)
+                .Select(l => l.Description.ToLower()));
+            sb.Append($"Likely related to {core}. ");
+        }
+
+        if (!string.IsNullOrEmpty(extractedText))
+        {
+            var snippet = extractedText.Replace("\n", " ");
+            snippet = snippet.Substring(0, Math.Min(100, snippet.Length));
+            sb.Append($"Detected text: {snippet}. ");
+        }
+
+        return sb.ToString().Trim();
+    }
+
+    private string DeterminePeriod(List<LabelInfo> labels, List<WebEntity> webEntities)
+    {
+        // Basit dönem tespiti - geliştirilecek
+        var periodKeywords = new Dictionary<string, string>
+        {
+            { "vintage", "1950-1980" },
+            { "antique", "1900-1950" },
+            { "retro", "1960-1990" },
+            { "classic", "1950-1980" }
+        };
+
+        foreach (var keyword in periodKeywords)
+        {
+            if (labels.Any(l => l.Description.ToLower().Contains(keyword.Key)) ||
+                webEntities.Any(w => w.Description.ToLower().Contains(keyword.Key)))
+            {
+                return keyword.Value;
+            }
+        }
+
+        return "bilinmiyor";
+    }
+
+    private List<string> DetermineMaterials(List<LabelInfo> labels)
+    {
+        var materials = new List<string>();
+        var materialKeywords = new Dictionary<string, string>
+        {
+            { "metal", "metal" },
+            { "plastic", "plastik" },
+            { "wood", "ahşap" },
+            { "glass", "cam" },
+            { "ceramic", "seramik" },
+            { "paper", "kağıt" },
+            { "leather", "deri" }
+        };
+
+        foreach (var keyword in materialKeywords)
+        {
+            if (labels.Any(l => l.Description.ToLower().Contains(keyword.Key)))
+            {
+                materials.Add(keyword.Value);
+            }
+        }
+
+        return materials.Any() ? materials : new List<string> { "bilinmiyor" };
+    }
+
+    private List<string> GenerateEvidence(List<LabelInfo> labels, List<WebEntity> webEntities, string extractedText)
+    {
+        var evidence = new List<string>();
+
+        if (labels.Any())
+        {
+            evidence.Add($"Görsel analiz sonucu tespit edilen özellikler: {string.Join(", ", labels.Take(3).Select(l => l.Description))}");
+        }
+
+        if (!string.IsNullOrEmpty(extractedText))
+        {
+            evidence.Add($"Nesne üzerinde tespit edilen metin: {extractedText.Substring(0, Math.Min(50, extractedText.Length))}");
+        }
+
+        if (webEntities.Any())
+        {
+            evidence.Add($"Web veritabanında eşleşen benzer nesneler bulundu");
+        }
+
+        return evidence;
+    }
+}

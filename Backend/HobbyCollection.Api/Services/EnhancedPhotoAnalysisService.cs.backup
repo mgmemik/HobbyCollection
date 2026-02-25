@@ -1,0 +1,1159 @@
+using Google.Cloud.Vision.V1;
+using Google.Cloud.AIPlatform.V1;
+using Google.Apis.Auth.OAuth2;
+using Google.Protobuf.WellKnownTypes;
+using Google.Protobuf;
+using System.Net.Http.Headers;
+using HobbyCollection.Api.Models;
+using System.Text;
+using System.Net.Http;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.IO;
+
+namespace HobbyCollection.Api.Services;
+
+public interface IEnhancedPhotoAnalysisService
+{
+    Task<EnhancedAnalysisResult> EnhancedProductAnalysisAsync(List<IFormFile> photos);
+    Task<List<SerpResult>> SearchWebForProductAsync(string query, int maxResults = 5);
+    Task<ProductIdentificationResult> IdentifyProductAdvancedAsync(AnalysisDataCollection data);
+}
+
+public class EnhancedPhotoAnalysisService : IEnhancedPhotoAnalysisService
+{
+    private readonly ImageAnnotatorClient _visionClient;
+    private readonly ILogger<EnhancedPhotoAnalysisService> _logger;
+    private readonly HttpClient _httpClient;
+    private readonly string _serpApiKey = Environment.GetEnvironmentVariable("SERP_API_KEY") ?? "";
+    private readonly string _vertexAiProjectId = Environment.GetEnvironmentVariable("GOOGLE_CLOUD_PROJECT") ?? "";
+    private readonly string _vertexAiLocation = Environment.GetEnvironmentVariable("GOOGLE_CLOUD_LOCATION") ?? "us-central1";
+
+    public EnhancedPhotoAnalysisService(ILogger<EnhancedPhotoAnalysisService> logger)
+    {
+        _logger = logger;
+        _httpClient = new HttpClient();
+        _httpClient.Timeout = TimeSpan.FromSeconds(30);
+        _visionClient = ImageAnnotatorClient.Create();
+    }
+
+    /// <summary>
+    /// Gelişmiş ürün analizi - Katman 1: Veri Toplama
+    /// </summary>
+    public async Task<EnhancedAnalysisResult> EnhancedProductAnalysisAsync(List<IFormFile> photos)
+    {
+        _logger.LogInformation("Gelişmiş ürün analizi başlatılıyor...");
+
+        var allData = new AnalysisDataCollection();
+
+        _logger.LogInformation("[STEP 1] Her fotoğraf ayrı ayrı analiz ediliyor...");
+        _logger.LogInformation($"Toplam fotoğraf sayısı: {photos.Count}");
+
+        // 1. Her fotoğrafı ayrı ayrı analiz et
+        foreach (var photo in photos)
+        {
+            _logger.LogInformation($"[STEP 1.{photos.IndexOf(photo) + 1}] Fotoğraf analiz ediliyor: {photo.FileName}, Boyut: {photo.Length} bytes");
+            var photoData = await AnalyzeSinglePhotoAdvancedAsync(photo);
+            allData.VisionResults.Add(photoData);
+            _logger.LogInformation($"[STEP 1.{photos.IndexOf(photo) + 1}] Vision API sonuçları - Labels: {photoData.Labels?.Count ?? 0}, OCR: {photoData.ExtractedText?.Length ?? 0} karakter");
+        }
+
+        // 2. OCR verilerini birleştir
+        _logger.LogInformation("[STEP 2] OCR verilerini birleştiriliyor...");
+        var combinedOcrText = string.Join(" ", allData.VisionResults.Select(v => v.ExtractedText));
+        allData.OcrText = combinedOcrText;
+        _logger.LogInformation($"[STEP 2] OCR metni birleştirildi: {combinedOcrText.Length} karakter");
+        _logger.LogInformation($"[STEP 2] OCR içeriği: '{combinedOcrText.Substring(0, Math.Min(200, combinedOcrText.Length))}'");
+
+        // 3. Web aramaları yap
+        _logger.LogInformation("[STEP 3] Web aramaları yapılıyor...");
+        var searchQueries = GenerateSearchQueries(allData);
+        _logger.LogInformation($"[STEP 3] Arama sorguları üretildi: {searchQueries.Count} sorgu");
+        foreach (var query in searchQueries)
+        {
+            _logger.LogInformation($"[STEP 3] Arama sorgusu: '{query}'");
+            var webResults = await SearchWebForProductAsync(query, 3);
+            allData.WebSearchResults.AddRange(webResults);
+            _logger.LogInformation($"[STEP 3] Web arama sonuçları: {webResults.Count} sonuç");
+        }
+
+    // 4. Yapay zeka ile final analiz
+    _logger.LogInformation("[STEP 4] Yapay zeka ile final analiz yapılıyor...");
+    var finalResult = await IdentifyProductAdvancedAsync(allData);
+    _logger.LogInformation($"[STEP 4] Final analiz tamamlandı: '{finalResult.ProductName}', Confidence: {finalResult.Confidence:F3}");
+
+    // 5. Gelişmiş hashtag'ler üret
+    _logger.LogInformation("[STEP 5] Gelişmiş hashtag'ler üretiliyor...");
+    var enhancedHashtags = GenerateEnhancedHashtags(finalResult, allData);
+
+    // Sonuç objesini güncelle
+    return new EnhancedAnalysisResult
+    {
+        DataCollection = allData,
+        FinalIdentification = finalResult,
+        Confidence = finalResult.Confidence,
+        ProcessingTime = DateTime.UtcNow - DateTime.UtcNow // Placeholder, actual calculation needed
+    };
+
+        return new EnhancedAnalysisResult
+        {
+            DataCollection = allData,
+            FinalIdentification = finalResult,
+            Confidence = finalResult.Confidence,
+            ProcessingTime = DateTime.UtcNow - DateTime.UtcNow
+        };
+    }
+
+    /// <summary>
+    /// Tek fotoğraf için gelişmiş analiz
+    /// </summary>
+    private async Task<VisionAnalysisData> AnalyzeSinglePhotoAdvancedAsync(IFormFile photo)
+    {
+        try
+        {
+            _logger.LogInformation($"[ADVANCED SINGLE] Vision API analizi başlatılıyor: {photo.FileName}");
+
+            // Fotoğrafı byte array'e dönüştür
+            byte[] imageBytes;
+            using (var memoryStream = new MemoryStream())
+            {
+                await photo.CopyToAsync(memoryStream);
+                imageBytes = memoryStream.ToArray();
+            }
+            _logger.LogInformation($"[ADVANCED SINGLE] Görüntü byte array'e dönüştürüldü: {imageBytes.Length} bytes");
+
+            var image = Image.FromBytes(imageBytes);
+            _logger.LogInformation($"[ADVANCED SINGLE] Vision API Image objesi oluşturuldu");
+
+            // Gelişmiş analiz - daha fazla özellik
+            _logger.LogInformation($"[ADVANCED SINGLE] Vision API istekleri hazırlanıyor...");
+            var requests = new[]
+            {
+                new AnnotateImageRequest
+                {
+                    Image = image,
+                    Features =
+                    {
+                        new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.LabelDetection, MaxResults = 50 },
+                        new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.WebDetection, MaxResults = 50 },
+                        new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.ObjectLocalization, MaxResults = 20 },
+                        new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.TextDetection, MaxResults = 20 },
+                        new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.LogoDetection, MaxResults = 10 },
+                        new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.ProductSearch, MaxResults = 10 },
+                        new Google.Cloud.Vision.V1.Feature { Type = Google.Cloud.Vision.V1.Feature.Types.Type.SafeSearchDetection, MaxResults = 1 }
+                    }
+                }
+            };
+
+            _logger.LogInformation($"[ADVANCED SINGLE] Google Cloud Vision API çağrısı yapılıyor...");
+            var response = await _visionClient.BatchAnnotateImagesAsync(requests);
+
+            if (response.Responses.Count == 0)
+            {
+                _logger.LogWarning("[ADVANCED SINGLE] Vision API'den yanıt alınamadı");
+                return new VisionAnalysisData();
+            }
+
+                var annotationResponse = response.Responses[0];
+
+                // Vision API error kontrolü
+                if (annotationResponse.Error != null)
+                {
+                    _logger.LogWarning($"[ADVANCED SINGLE] Vision API hatası: {annotationResponse.Error.Code} - {annotationResponse.Error.Message}");
+                    if (annotationResponse.Error.Code == 3) // BAD_IMAGE_DATA
+                    {
+                        _logger.LogWarning($"[ADVANCED SINGLE] Küçük veya bozuk fotoğraf algılandı, boş sonuç döndürülüyor");
+                    }
+                    return new VisionAnalysisData();
+                }
+
+                _logger.LogInformation($"[ADVANCED SINGLE] Vision API yanıtı alındı. Response count: {response.Responses.Count}");
+                _logger.LogInformation($"[ADVANCED SINGLE] Annotation sonuçları - Labels: {annotationResponse.LabelAnnotations?.Count ?? 0}, WebEntities: {annotationResponse.WebDetection?.WebEntities?.Count ?? 0}, Objects: {annotationResponse.LocalizedObjectAnnotations?.Count ?? 0}, Texts: {annotationResponse.TextAnnotations?.Count ?? 0}");
+
+                if (annotationResponse.TextAnnotations?.Count > 0)
+                {
+                    var firstText = annotationResponse.TextAnnotations[0];
+                    _logger.LogInformation($"[ADVANCED SINGLE] İlk OCR metni: '{firstText.Description?.Substring(0, Math.Min(100, firstText.Description?.Length ?? 0)) ?? "null"}'");
+                }
+
+                // En iyi 5 label'ı log'la
+                if (annotationResponse.LabelAnnotations?.Count > 0)
+                {
+                    var topLabels = annotationResponse.LabelAnnotations.Take(5);
+                    _logger.LogInformation($"[ADVANCED SINGLE] En iyi 5 label: {string.Join(", ", topLabels.Select(l => $"'{l.Description}'({l.Score:F3})"))}");
+                }
+
+                // Gelişmiş veri çıkarma
+                var visionData = new VisionAnalysisData
+                {
+                    Labels = annotationResponse.LabelAnnotations?.Select(l => new LabelInfo
+                    {
+                        Description = l.Description,
+                        Score = l.Score
+                    }).ToList() ?? new List<LabelInfo>(),
+
+                    WebEntities = annotationResponse.WebDetection?.WebEntities?.Select(w => new WebEntity
+                    {
+                        EntityId = w.EntityId ?? "",
+                        Description = w.Description ?? "",
+                        Score = w.Score
+                    }).ToList() ?? new List<WebEntity>(),
+
+                    Objects = annotationResponse.LocalizedObjectAnnotations?.Select(o => new ObjectInfo
+                    {
+                        Name = o.Name,
+                        Score = o.Score,
+                        BoundingBox = new BoundingBox
+                        {
+                            Vertices = o.BoundingPoly?.NormalizedVertices?.Select(v => new HobbyCollection.Api.Models.Vertex
+                            {
+                                X = v.X,
+                                Y = v.Y
+                            }).ToList() ?? new List<HobbyCollection.Api.Models.Vertex>()
+                        }
+                    }).ToList() ?? new List<ObjectInfo>(),
+
+                    ExtractedText = annotationResponse.TextAnnotations?.Count > 0 ?
+                        string.Join(" ", annotationResponse.TextAnnotations.Select(t => t.Description)) : ""
+                };
+
+                _logger.LogInformation($"[ADVANCED SINGLE] Vision API veri çıkarma tamamlandı");
+                _logger.LogInformation($"[ADVANCED SINGLE] Labels: {visionData.Labels.Count}, WebEntities: {visionData.WebEntities.Count}, Objects: {visionData.Objects.Count}, ExtractedText: {visionData.ExtractedText.Length} karakter");
+
+                return visionData;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"[ADVANCED SINGLE] Vision API analizi hatası: {photo.FileName}");
+                return new VisionAnalysisData();
+            }
+        }
+                }).ToList(),
+
+                WebEntities = annotation.WebDetection?.WebEntities?.Select(w => new WebEntity
+                {
+                    EntityId = w.EntityId ?? "",
+                    Description = w.Description ?? "",
+                    Score = w.Score
+                }).ToList() ?? new List<WebEntity>(),
+
+                Objects = annotation.LocalizedObjectAnnotations.Select(o => new ObjectInfo
+                {
+                    Name = o.Name,
+                    Score = o.Score,
+                    BoundingBox = new BoundingBox
+                    {
+                        Vertices = o.BoundingPoly.Vertices.Select(v => new Models.Vertex
+                        {
+                            X = v.X,
+                            Y = v.Y
+                        }).ToList()
+                    }
+                }).ToList(),
+
+                ExtractedText = string.Join(" ", annotation.TextAnnotations.Select(t => t.Description))
+
+                // LogoAnnotations ve ProductSearchResults mevcut değil, kaldırıldı
+            };
+
+            return visionData;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, $"Gelişmiş fotoğraf analizi hatası: {photo.FileName}");
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Web aramaları için sorgu üret
+    /// </summary>
+    private List<string> GenerateSearchQueries(AnalysisDataCollection data)
+    {
+        var queries = new List<string>();
+
+        // OCR metninden sorgular
+        if (!string.IsNullOrEmpty(data.OcrText))
+        {
+            var ocrQueries = ExtractProductQueriesFromText(data.OcrText);
+            queries.AddRange(ocrQueries);
+        }
+
+        // Vision sonuçlarından sorgular
+        var topLabels = data.VisionResults
+            .SelectMany(v => v.Labels)
+            .OrderByDescending(l => l.Score)
+            .Take(10)
+            .Select(l => l.Description)
+            .Distinct()
+            .ToList();
+
+        if (topLabels.Any())
+        {
+            queries.Add(string.Join(" ", topLabels.Take(5)));
+        }
+
+        // Marka/model bilgileri
+        var brandInfo = data.VisionResults
+            .SelectMany(v => v.WebEntities)
+            .Where(w => w.Score > 0.7)
+            .OrderByDescending(w => w.Score)
+            .Take(3)
+            .ToList();
+
+        foreach (var brand in brandInfo)
+        {
+            queries.Add($"\"{brand.Description}\" ürün");
+        }
+
+        return queries.Distinct().Take(10).ToList();
+    }
+
+    /// <summary>
+    /// OCR metninden ürün sorguları çıkar
+    /// </summary>
+    private List<string> ExtractProductQueriesFromText(string text)
+    {
+        var queries = new List<string>();
+
+        // Model numaraları ara (örn: iPhone 12, Samsung S21, vb.)
+        var modelPatterns = new[]
+        {
+            @"\b[A-Z][a-zA-Z]*\s*\d+[A-Z]*\d*\b", // iPhone 12, Samsung S21
+            @"\b[A-Z]\d+[A-Z]?\s*\d*\b", // A52 4G, iPhone X
+            @"\b\d+\s*GB\b", // 128 GB, 64GB
+            @"\b[A-Z]{2,}\s+[A-Z]\d+", // IPHONE 12, SAMSUNG S21
+        };
+
+        foreach (var pattern in modelPatterns)
+        {
+            var matches = Regex.Matches(text, pattern, RegexOptions.IgnoreCase);
+            foreach (Match match in matches)
+            {
+                queries.Add(match.Value);
+            }
+        }
+
+        // Marka isimleri ara
+        var brandPatterns = new[]
+        {
+            @"\bApple\b", @"\bSamsung\b", @"\bSony\b", @"\bNikon\b",
+            @"\bCanon\b", @"\bHuawei\b", @"\bXiaomi\b", @"\bGoogle\b"
+        };
+
+        foreach (var pattern in brandPatterns)
+        {
+            if (Regex.IsMatch(text, pattern, RegexOptions.IgnoreCase))
+            {
+                queries.Add(pattern.Replace(@"\b", ""));
+            }
+        }
+
+        return queries.Distinct().Take(5).ToList();
+    }
+
+    /// <summary>
+    /// Web'de ürün araması yap
+    /// </summary>
+    public async Task<List<SerpResult>> SearchWebForProductAsync(string query, int maxResults = 5)
+    {
+        if (string.IsNullOrEmpty(_serpApiKey))
+        {
+            _logger.LogWarning("SERP API key bulunamadı, web araması atlanıyor");
+            return new List<SerpResult>();
+        }
+
+        try
+        {
+            var searchQuery = $"{query} koleksiyon ürün";
+            var url = $"https://serpapi.com/search.json?q={Uri.EscapeDataString(searchQuery)}&api_key={_serpApiKey}&num={maxResults}";
+
+            var response = await _httpClient.GetAsync(url);
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogWarning($"SERP API hatası: {response.StatusCode}");
+                return new List<SerpResult>();
+            }
+
+            var jsonContent = await response.Content.ReadAsStringAsync();
+            var serpResponse = JsonSerializer.Deserialize<SerpApiResponse>(jsonContent);
+
+            return serpResponse?.organic_results?.Take(maxResults).Select(r => new SerpResult
+            {
+                Title = r.title ?? "",
+                Link = r.link ?? "",
+                Snippet = r.snippet ?? "",
+                DisplayLink = r.displaylink ?? ""
+            }).ToList() ?? new List<SerpResult>();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, $"Web araması hatası: {query}");
+            return new List<SerpResult>();
+        }
+    }
+
+    /// <summary>
+    /// Tüm verileri kullanarak gelişmiş ürün tanımlama
+    /// </summary>
+    public async Task<ProductIdentificationResult> IdentifyProductAdvancedAsync(AnalysisDataCollection data)
+    {
+        try
+        {
+            // 1. OCR ile model bilgisi çıkar
+            var ocrModelInfo = ExtractModelInfoFromOCR(data.OcrText);
+
+            // 2. Vision API sonuçlarından marka/model çıkar
+            var visionModelInfo = ExtractModelInfoFromVision(data);
+
+            // 3. Web arama sonuçlarından bilgi çıkar
+            var webModelInfo = ExtractModelInfoFromWeb(data.WebSearchResults);
+
+            // 4. Tüm bilgileri birleştir
+            var allCandidates = new List<ProductCandidate>();
+            allCandidates.AddRange(ocrModelInfo);
+            allCandidates.AddRange(visionModelInfo);
+            allCandidates.AddRange(webModelInfo);
+
+        // 5. Confidence scoring yap (OCR ve Vision kombinasyonu)
+        var scoredCandidates = ScoreProductCandidates(allCandidates, data);
+
+        // OCR confidence'ı ekle
+        var ocrConfidence = CalculateOCRConfidence(data.OcrText);
+        if (ocrConfidence > 0.3)
+        {
+            scoredCandidates.ForEach(c => c.Confidence = Math.Min(1.0, c.Confidence + ocrConfidence * 0.3));
+        }
+
+            // 6. En iyi sonucu seç
+            var bestCandidate = scoredCandidates.OrderByDescending(c => c.Confidence).FirstOrDefault();
+
+            if (bestCandidate == null)
+            {
+                return new ProductIdentificationResult
+                {
+                    ProductName = "Bilinmeyen Ürün",
+                    Confidence = 0.0,
+                    Reasoning = "Yeterli bilgi bulunamadı"
+                };
+            }
+
+            // 7. Yapay zeka ile final doğrulama
+            var finalValidation = await ValidateWithAI(bestCandidate, data);
+
+            return new ProductIdentificationResult
+            {
+                ProductName = finalValidation.ProductName,
+                Brand = finalValidation.Brand,
+                Model = finalValidation.Model,
+                Confidence = finalValidation.Confidence,
+                Reasoning = finalValidation.Reasoning,
+                Evidence = finalValidation.Evidence
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Gelişmiş ürün tanımlama hatası");
+            return new ProductIdentificationResult
+            {
+                ProductName = "Analiz Hatası",
+                Confidence = 0.0,
+                Reasoning = ex.Message
+            };
+        }
+    }
+
+    /// <summary>
+    /// OCR metninden model bilgisi çıkar
+    /// </summary>
+    private List<ProductCandidate> ExtractModelInfoFromOCR(string ocrText)
+    {
+        var candidates = new List<ProductCandidate>();
+
+        // Model pattern'ları
+        var patterns = new[]
+        {
+            @"(\w+)\s*(?:iPhone|Galaxy|Note|Edge|Pro|Plus|Max|Mini)\s*(\d+)",
+            @"(\w+)\s*(\d+)\s*(?:GB|TB|G)",
+            @"Model\s*:\s*([A-Z0-9\-]+)",
+            @"Serial\s*:\s*([A-Z0-9\-]+)",
+            @"Product\s*:\s*([A-Z0-9\-]+)"
+        };
+
+        foreach (var pattern in patterns)
+        {
+            var matches = Regex.Matches(ocrText, pattern, RegexOptions.IgnoreCase);
+            foreach (Match match in matches)
+            {
+                if (match.Groups.Count > 1)
+                {
+                    candidates.Add(new ProductCandidate
+                    {
+                        RawText = match.Value,
+                        Brand = match.Groups[1].Value,
+                        Model = match.Groups.Count > 2 ? match.Groups[2].Value : "",
+                        Source = "OCR",
+                        Confidence = 0.8
+                    });
+                }
+            }
+        }
+
+        return candidates;
+    }
+
+    /// <summary>
+    /// Vision API sonuçlarından model bilgisi çıkar
+    /// </summary>
+    private List<ProductCandidate> ExtractModelInfoFromVision(AnalysisDataCollection data)
+    {
+        var candidates = new List<ProductCandidate>();
+
+        // Web entities'den model bilgisi çıkar (ProductSearch mevcut değil)
+        foreach (var visionData in data.VisionResults)
+        {
+            foreach (var webEntity in visionData.WebEntities)
+            {
+                if (webEntity.Score > 0.8) // Yüksek güven skorlu olanları al
+                {
+                    var nameParts = webEntity.Description.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                    if (nameParts.Length >= 2)
+                    {
+                        candidates.Add(new ProductCandidate
+                        {
+                            RawText = webEntity.Description,
+                            Brand = nameParts[0],
+                            Model = string.Join(" ", nameParts.Skip(1)),
+                            Source = "WebEntity",
+                            Confidence = webEntity.Score
+                        });
+                    }
+                }
+            }
+        }
+
+        // Label'lardan da model bilgisi çıkar
+        foreach (var visionData in data.VisionResults)
+        {
+            foreach (var label in visionData.Labels)
+            {
+                if (label.Score > 0.9) // Çok yüksek güven skorlu label'lar
+                {
+                    candidates.Add(new ProductCandidate
+                    {
+                        RawText = label.Description,
+                        Brand = label.Description,
+                        Source = "LabelDetection",
+                        Confidence = label.Score
+                    });
+                }
+            }
+        }
+
+        return candidates;
+    }
+
+    /// <summary>
+    /// Web arama sonuçlarından model bilgisi çıkar
+    /// </summary>
+    private List<ProductCandidate> ExtractModelInfoFromWeb(List<SerpResult> webResults)
+    {
+        var candidates = new List<ProductCandidate>();
+
+        foreach (var result in webResults)
+        {
+            // Title'dan ürün bilgisi çıkar
+            var titleWords = result.Title.Split(' ', StringSplitOptions.RemoveEmptyEntries).ToArray();
+            if (titleWords.Length >= 3)
+            {
+                // Brand: ilk kelime, Model: sonraki kelimeler
+                candidates.Add(new ProductCandidate
+                {
+                    RawText = result.Title,
+                    Brand = titleWords[0],
+                    Model = string.Join(" ", titleWords.Skip(1).Take(3)),
+                    Source = "WebSearch",
+                    Confidence = 0.6
+                });
+            }
+        }
+
+        return candidates;
+    }
+
+    /// <summary>
+    /// Ürün adaylarını puanla
+    /// </summary>
+    private List<ProductCandidate> ScoreProductCandidates(List<ProductCandidate> candidates, AnalysisDataCollection data)
+    {
+        foreach (var candidate in candidates)
+        {
+            var score = 0.0;
+
+            // Kaynak tipine göre başlangıç puanı
+            switch (candidate.Source)
+            {
+                case "OCR":
+                    score += 0.9; // OCR en güvenilir
+                    break;
+                case "ProductSearch":
+                    score += 0.7;
+                    break;
+                case "LogoDetection":
+                    score += 0.6;
+                    break;
+                case "WebSearch":
+                    score += 0.4;
+                    break;
+                default:
+                    score += 0.3;
+                    break;
+            }
+
+            // Model numarası içeriyorsa bonus
+            if (Regex.IsMatch(candidate.Model ?? "", @"\d"))
+            {
+                score += 0.2;
+            }
+
+            // Marka adı içeriyorsa bonus
+            var knownBrands = new[] { "Apple", "Samsung", "Sony", "Canon", "Nikon", "Google", "Huawei", "Xiaomi" };
+            if (knownBrands.Any(b => candidate.Brand?.Contains(b, StringComparison.OrdinalIgnoreCase) == true))
+            {
+                score += 0.3;
+            }
+
+            candidate.Confidence = Math.Min(1.0, score);
+        }
+
+        return candidates;
+    }
+
+    /// <summary>
+    /// Yapay zeka ile final doğrulama
+    /// </summary>
+    private async Task<ProductIdentificationResult> ValidateWithAI(ProductCandidate candidate, AnalysisDataCollection data)
+    {
+        if (string.IsNullOrEmpty(_vertexAiProjectId))
+        {
+            // Vertex AI yoksa fallback ama daha iyi sonuç üret
+            var enhancedName = GenerateEnhancedProductName(candidate, data);
+            return new ProductIdentificationResult
+            {
+                ProductName = enhancedName.ProductName,
+                Brand = enhancedName.Brand,
+                Model = enhancedName.Model,
+                Confidence = Math.Max(candidate.Confidence, 0.4), // Minimum confidence
+                Reasoning = $"Gelişmiş analiz: OCR + Vision API sonuçları birleştirildi. Google AI doğrulaması için credentials gerekli."
+            };
+        }
+
+        try
+        {
+            var prompt = $@"
+Sen bir ürün tanımlama uzmanısın. Sana verilen bilgileri analiz ederek en olası ürün kimliğini belirle.
+
+Verilen bilgiler:
+- Marka: {candidate.Brand}
+- Model: {candidate.Model}
+- Kaynak: {candidate.Source}
+- Ham Metin: {candidate.RawText}
+- OCR Metni: {data.OcrText.Substring(0, Math.Min(200, data.OcrText.Length))}
+- Güven Skoru: {candidate.Confidence:F2}
+
+Lütfen şu bilgileri JSON formatında döndür:
+{{
+  ""productName"": ""tam ürün adı"",
+  ""brand"": ""marka"",
+  ""model"": ""model"",
+  ""confidence"": 0.95,
+  ""reasoning"": ""neden bu sonuca vardığın"",
+  ""evidence"": [""kanıt 1"", ""kanıt 2""]
+}}
+
+Sadece JSON döndür, başka açıklama yapma.";
+
+            // Vertex AI Gemini Pro kullanımı - REST API
+            var vertexAiUrl = $"https://{_vertexAiLocation}-aiplatform.googleapis.com/v1/projects/{_vertexAiProjectId}/locations/{_vertexAiLocation}/publishers/google/models/gemini-1.5-pro-002:generateContent";
+
+            var requestBody = new
+            {
+                contents = new[]
+                {
+                    new
+                    {
+                        parts = new[]
+                        {
+                            new { text = prompt }
+                        }
+                    }
+                },
+                generationConfig = new
+                {
+                    temperature = 0.3,
+                    maxOutputTokens = 300,
+                    topP = 1.0,
+                    topK = 40
+                }
+            };
+
+            var jsonRequest = JsonSerializer.Serialize(requestBody);
+            var content = new StringContent(jsonRequest, Encoding.UTF8, "application/json");
+
+            // Google Cloud credentials'ını otomatik al
+            var credentials = GoogleCredential.GetApplicationDefault();
+            var token = await credentials.UnderlyingCredential.GetAccessTokenForRequestAsync(vertexAiUrl);
+
+            _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+            var response = await _httpClient.PostAsync(vertexAiUrl, content);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new Exception($"Vertex AI API hatası: {response.StatusCode} - {await response.Content.ReadAsStringAsync()}");
+            }
+
+            var jsonResponse = await response.Content.ReadAsStringAsync();
+            var vertexResult = JsonSerializer.Deserialize<VertexAIResponse>(jsonResponse);
+
+            if (vertexResult?.candidates?.FirstOrDefault()?.content?.parts?.FirstOrDefault()?.text == null)
+            {
+                throw new Exception("Vertex AI response parsing hatası");
+            }
+
+            var aiTextResponse = vertexResult!.candidates!.First()!.content!.parts!.First()!.text!;
+
+            // JSON response'ı parse et
+            var finalResult = JsonSerializer.Deserialize<ProductIdentificationResult>(aiTextResponse);
+
+            return finalResult ?? new ProductIdentificationResult
+            {
+                ProductName = candidate.RawText,
+                Brand = candidate.Brand,
+                Model = candidate.Model,
+                Confidence = candidate.Confidence,
+                Reasoning = "Google AI parsing hatası"
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Google Vertex AI validasyon hatası");
+            return new ProductIdentificationResult
+            {
+                ProductName = $"{candidate.Brand} {candidate.Model}".Trim(),
+                Brand = candidate.Brand,
+                Model = candidate.Model,
+                Confidence = candidate.Confidence,
+                Reasoning = $"Google AI validasyonu başarısız, temel bilgilerle devam: {candidate.Source}"
+            };
+        }
+    }
+
+    /// <summary>
+    /// OCR ve Vision API sonuçlarından daha iyi ürün adı üretir
+    /// </summary>
+    private (string ProductName, string Brand, string Model) GenerateEnhancedProductName(ProductCandidate candidate, AnalysisDataCollection data)
+    {
+        var ocrText = data.OcrText ?? "";
+
+        // OCR metninden potansiyel marka ve model bilgilerini çıkar
+        var extractedInfo = ExtractProductInfoFromOCR(ocrText);
+
+        // Vision API sonuçlarından en iyi label'ları al
+        var bestLabels = data.VisionResults
+            .SelectMany(v => v.Labels ?? new List<LabelInfo>())
+            .OrderByDescending(l => l.Score)
+            .Take(5)
+            .Select(l => l.Description)
+            .ToList();
+
+        // Marka ve model bilgilerini birleştir
+        var brand = candidate.Brand;
+        var model = candidate.Model;
+
+        // OCR'den daha iyi marka/model bilgisi çıkarabildiysek kullan
+        if (!string.IsNullOrEmpty(extractedInfo.Brand) && extractedInfo.Brand.Length > brand.Length)
+        {
+            brand = extractedInfo.Brand;
+        }
+
+        if (!string.IsNullOrEmpty(extractedInfo.Model) && extractedInfo.Model.Length > model.Length)
+        {
+            model = extractedInfo.Model;
+        }
+
+        // Ürün adını oluştur
+        var productName = $"{brand} {model}".Trim();
+
+        // Eğer ürün adı çok genel ise, en iyi label'dan daha spesifik bir isim üret
+        if (productName.Length < 10 && bestLabels.Any())
+        {
+            var specificLabel = bestLabels.FirstOrDefault(l => l.Length > 10) ?? bestLabels.FirstOrDefault() ?? "";
+            if (!string.IsNullOrEmpty(specificLabel))
+            {
+                productName = $"{brand} {specificLabel}".Trim();
+            }
+        }
+
+        // Intel işlemci için özel handling
+        if (brand == "INTEL" && !string.IsNullOrEmpty(model))
+        {
+            if (model.StartsWith("BP") && model.Length >= 8)
+            {
+                productName = $"Intel {model}";
+            }
+            else if (model.StartsWith("ICOMP"))
+            {
+                productName = $"Intel Processor {model}";
+            }
+            else
+            {
+                productName = $"Intel {model}";
+            }
+        }
+        // Eğer hala genel bir isim varsa, OCR'den spesifik bilgi çıkar
+        else if (productName.Contains("Electronic device") || productName.Length < 5)
+        {
+            productName = ExtractBestProductNameFromOCR(ocrText, brand);
+        }
+
+        return (productName, brand, model);
+    }
+
+    /// <summary>
+    /// OCR metninden ürün bilgilerini çıkarır
+    /// </summary>
+    private (string Brand, string Model) ExtractProductInfoFromOCR(string ocrText)
+    {
+        if (string.IsNullOrEmpty(ocrText))
+            return ("", "");
+
+        var lines = ocrText.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        var brand = "";
+        var model = "";
+
+        // Bilinen marka kelimelerini ara (daha kapsamlı liste)
+        var knownBrands = new[] {
+            "intel", "pentium", "amd", "nvidia", "apple", "samsung", "sony", "canon", "nikon",
+            "hp", "dell", "asus", "lenovo", "logitech", "microsoft", "toshiba",
+            "acer", "razer", "corsair", "kingston", "seagate", "western digital",
+            "intel pentium", "intel core", "amd ryzen", "nvidia geforce"
+        };
+
+        // OCR metnini temizle ve normalize et
+        var cleanedText = CleanOCRText(ocrText);
+
+        // Önce tam metinde marka ara
+        foreach (var knownBrand in knownBrands)
+        {
+            if (cleanedText.ToLower().Contains(knownBrand.ToLower()))
+            {
+                // Intel markası için özel handling
+                if (knownBrand.ToLower().Contains("intel"))
+                {
+                    brand = "INTEL";
+                }
+                else if (knownBrand.ToLower().Contains("pentium"))
+                {
+                    brand = "INTEL"; // Pentium Intel'in markası
+                }
+                else
+                {
+                    brand = knownBrand.ToUpper();
+                }
+                break;
+            }
+        }
+
+        // Model numarası ara - daha akıllı pattern (Intel işlemci odaklı)
+        var modelPatterns = new[] {
+            @"[A-Z]{2,}[0-9]{3,}",  // İki harf + üç rakam (örn: BP805, ICOMP)
+            @"[0-9]{4,}",           // Dört veya daha fazla rakam (örn: 8549)
+            @"[A-Z]{3,}[0-9]{2,}",  // Üç harf + iki rakam (örn: BP80)
+            @"[A-Z0-9]{5,}",         // Beş veya daha fazla alfanumerik
+            @"BP[0-9]{6,}",         // Intel BP serisi (örn: BP8050275)
+            @"ICOMP.*[0-9]{3,}",    // Intel ICOMP serisi
+            @"INDEX.*[0-9]{3,}"     // Intel INDEX serisi
+        };
+
+        foreach (var line in lines)
+        {
+            var cleanLine = line.Trim();
+
+            // Model pattern'larını ara
+            foreach (var pattern in modelPatterns)
+            {
+                var matches = Regex.Matches(cleanLine, pattern, RegexOptions.IgnoreCase);
+                if (matches.Count > 0)
+                {
+                    var foundModel = matches[0].Value.Trim().ToUpper();
+
+                    // Intel işlemci model numarası için özel validation
+                    if (cleanedText.ToLower().Contains("intel") || cleanedText.ToLower().Contains("pentium"))
+                    {
+                        // Intel model numarası validation
+                        if (foundModel.StartsWith("BP") && foundModel.Length >= 8)
+                        {
+                            model = foundModel;
+                            break; // En iyi Intel model numarasını bulduk
+                        }
+                        else if (foundModel.StartsWith("ICOMP") || foundModel.StartsWith("INDEX"))
+                        {
+                            model = foundModel;
+                            break;
+                        }
+                        else if (foundModel.Length >= 8 && !foundModel.Contains("PHILIPPINES"))
+                        {
+                            model = foundModel;
+                        }
+                    }
+                    else if (foundModel.Length > model.Length && foundModel.Length >= 4)
+                    {
+                        model = foundModel;
+                    }
+                }
+            }
+        }
+
+        return (brand, model);
+    }
+
+    /// <summary>
+    /// OCR metnini temizler ve normalize eder
+    /// </summary>
+    private string CleanOCRText(string ocrText)
+    {
+        if (string.IsNullOrEmpty(ocrText))
+            return "";
+
+        // OCR hatalarını düzelt ve sık kullanılan yanlış OCR karakterlerini düzelt
+        var cleaned = ocrText
+            .Replace("®", "")
+            .Replace("™", "")
+            .Replace("©", "")
+            .Replace("°", "")
+            .Replace("·", "")
+            .Replace("•", "")
+            .Replace("\"", "")
+            .Replace("'", "")
+            .Replace("-", " ")
+            .Replace("_", " ")
+            .Replace("szen", "szén") // OCR hatası düzeltimi
+            .Replace("INTELO", "INTEL") // OCR hatası düzeltimi
+            .Replace("  ", " ") // Çift boşlukları tek yap
+            .Trim();
+
+        return cleaned;
+    }
+
+    /// <summary>
+    /// OCR metninden en iyi ürün adını çıkarır
+    /// </summary>
+    private string ExtractBestProductNameFromOCR(string ocrText, string defaultBrand)
+    {
+        var lines = ocrText.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+
+        // En uzun ve en spesifik metin satırını bul
+        var bestLine = lines
+            .Where(l => l.Length > 5 && !l.All(char.IsDigit))
+            .OrderByDescending(l => l.Length)
+            .FirstOrDefault();
+
+        if (!string.IsNullOrEmpty(bestLine))
+        {
+            // Eğer marka bilgisi varsa, onu başa koy
+            if (!string.IsNullOrEmpty(defaultBrand))
+            {
+                return $"{defaultBrand} {bestLine.Trim()}";
+            }
+            return bestLine.Trim();
+        }
+
+        return $"{defaultBrand} Ürün".Trim();
+    }
+
+    /// <summary>
+    /// OCR metninin güvenilirliğini hesaplar
+    /// </summary>
+    private double CalculateOCRConfidence(string ocrText)
+    {
+        if (string.IsNullOrEmpty(ocrText))
+            return 0.0;
+
+        var cleanedText = CleanOCRText(ocrText);
+        var confidence = 0.0;
+
+        // Uzunluk skoru (daha uzun metin = daha yüksek confidence)
+        confidence += Math.Min(0.3, cleanedText.Length / 100.0);
+
+        // Alfanumerik karakter oranı
+        var alphanumericChars = cleanedText.Count(char.IsLetterOrDigit);
+        var alphanumericRatio = (double)alphanumericChars / cleanedText.Length;
+        confidence += alphanumericRatio * 0.2;
+
+        // Bilinen marka kelimeleri varsa (Intel için ekstra puan)
+        var knownBrands = new[] {
+            "intel", "amd", "nvidia", "apple", "samsung", "sony", "canon", "nikon",
+            "hp", "dell", "asus", "lenovo", "logitech", "microsoft", "toshiba"
+        };
+
+        var hasKnownBrand = knownBrands.Any(brand =>
+            cleanedText.ToLower().Contains(brand));
+
+        // Intel markası için ekstra confidence
+        var isIntel = cleanedText.ToLower().Contains("intel") || cleanedText.ToLower().Contains("pentium");
+        if (isIntel)
+            confidence += 0.3;
+
+        if (hasKnownBrand)
+            confidence += 0.2;
+
+        // Model numarası pattern'ları varsa
+        var modelPatterns = new[] {
+            @"[A-Z]{2,}[0-9]{3,}",
+            @"[0-9]{4,}",
+            @"[A-Z]{3,}[0-9]{2,}"
+        };
+
+        var hasModelPattern = modelPatterns.Any(pattern =>
+            Regex.IsMatch(cleanedText, pattern, RegexOptions.IgnoreCase));
+
+        // Intel model numarası için ekstra confidence
+        var hasIntelModel = Regex.IsMatch(cleanedText, @"BP[0-9]{6,}", RegexOptions.IgnoreCase) ||
+                           Regex.IsMatch(cleanedText, @"ICOMP.*[0-9]{3,}", RegexOptions.IgnoreCase) ||
+                           Regex.IsMatch(cleanedText, @"INDEX.*[0-9]{3,}", RegexOptions.IgnoreCase);
+
+        if (hasIntelModel)
+            confidence += 0.4; // Intel model numarası için yüksek confidence
+        else if (hasModelPattern)
+            confidence += 0.2;
+
+        return Math.Min(0.9, confidence); // Maximum 90%
+    }
+
+    /// <summary>
+    /// Gelişmiş hashtag'ler üretir
+    /// </summary>
+    private List<string> GenerateEnhancedHashtags(ProductIdentificationResult finalResult, AnalysisDataCollection data)
+    {
+        var hashtags = new HashSet<string>();
+
+        // Ürün adından hashtag üret
+        var productWords = finalResult.ProductName.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        foreach (var word in productWords)
+        {
+            var clean = word.Replace("®", "").Replace("™", "").ToLower();
+            if (clean.Length > 2 && clean.Length < 20)
+            {
+                hashtags.Add($"#{clean}");
+            }
+        }
+
+        // Marka hashtag'i
+        if (!string.IsNullOrEmpty(finalResult.Brand))
+        {
+            hashtags.Add($"#{finalResult.Brand.ToLower()}");
+        }
+
+        // OCR metninden hashtag üret
+        if (!string.IsNullOrEmpty(data.OcrText))
+        {
+            var ocrWords = data.OcrText.Split(new[] { ' ', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (var word in ocrWords)
+            {
+                var clean = Regex.Replace(word, @"[^\w]", "").ToLower();
+                if (clean.Length > 3 && clean.Length < 15 && !clean.All(char.IsDigit))
+                {
+                    hashtags.Add($"#{clean}");
+                }
+            }
+        }
+
+        // Vision API label'larından hashtag üret
+        var labels = data.VisionResults
+            .SelectMany(v => v.Labels ?? new List<LabelInfo>())
+            .OrderByDescending(l => l.Score)
+            .Take(3)
+            .Select(l => l.Description);
+
+        foreach (var label in labels)
+        {
+            var clean = Regex.Replace(label, @"[^\w\s]", "").ToLower().Replace(" ", "");
+            if (clean.Length > 3 && clean.Length < 15)
+            {
+                hashtags.Add($"#{clean}");
+            }
+        }
+
+        // Genel koleksiyon hashtag'leri
+        hashtags.Add("#koleksiyon");
+        hashtags.Add("#antika");
+        hashtags.Add("#vintage");
+
+        return hashtags.Take(12).ToList();
+    }
+}
+
+// ========================================
+// YENİ MODEL SINIFLARI
+// ========================================
+
+public class ProductCandidate
+{
+    public string RawText { get; set; } = string.Empty;
+    public string Brand { get; set; } = string.Empty;
+    public string Model { get; set; } = string.Empty;
+    public string Source { get; set; } = string.Empty;
+    public double Confidence { get; set; }
+}
+
+public class LogoInfo
+{
+    public string Description { get; set; } = string.Empty;
+    public float Score { get; set; }
+    public BoundingBox BoundingBox { get; set; } = new();
+}
+
+public class ProductSearchInfo
+{
+    public string ProductName { get; set; } = string.Empty;
+    public float Score { get; set; }
+    public string ImageUrl { get; set; } = string.Empty;
+}
+
+// Helper classes for API responses
+public class SerpApiResponse
+{
+    public List<SerpOrganicResult>? organic_results { get; set; }
+}
+
+public class SerpOrganicResult
+{
+    public string? title { get; set; }
+    public string? link { get; set; }
+    public string? snippet { get; set; }
+    public string? displaylink { get; set; }
+}
+
+// Vertex AI Response Models
+public class VertexAIResponse
+{
+    public List<VertexAICandidate>? candidates { get; set; }
+}
+
+public class VertexAICandidate
+{
+    public VertexAIContent? content { get; set; }
+    public string? finishReason { get; set; }
+}
+
+public class VertexAIContent
+{
+    public List<VertexAIPart>? parts { get; set; }
+}
+
+public class VertexAIPart
+{
+    public string? text { get; set; }
+}
+

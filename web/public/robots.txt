@@ -1,0 +1,14 @@
+# robots.txt for Save All
+# https://save-all.com/robots.txt
+
+User-agent: *
+Allow: /
+Disallow: /api/
+Disallow: /account-deletion
+Disallow: /support
+
+# Sitemap location
+Sitemap: https://save-all.com/sitemap.xml
+
+# Crawl-delay (optional, be nice to servers)
+Crawl-delay: 1

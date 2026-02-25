@@ -1,0 +1,12 @@
+/Users/gokhanmemik/Dev/HobbyCollection/Backend/HobbyCollection.Domain/bin/Debug/net8.0/HobbyCollection.Domain.deps.json
+/Users/gokhanmemik/Dev/HobbyCollection/Backend/HobbyCollection.Domain/bin/Debug/net8.0/HobbyCollection.Domain.dll
+/Users/gokhanmemik/Dev/HobbyCollection/Backend/HobbyCollection.Domain/bin/Debug/net8.0/HobbyCollection.Domain.pdb
+/Users/gokhanmemik/Dev/HobbyCollection/Backend/HobbyCollection.Domain/obj/Debug/net8.0/HobbyCollection.Domain.GeneratedMSBuildEditorConfig.editorconfig
+/Users/gokhanmemik/Dev/HobbyCollection/Backend/HobbyCollection.Domain/obj/Debug/net8.0/HobbyCollection.Domain.AssemblyInfoInputs.cache
+/Users/gokhanmemik/Dev/HobbyCollection/Backend/HobbyCollection.Domain/obj/Debug/net8.0/HobbyCollection.Domain.AssemblyInfo.cs
+/Users/gokhanmemik/Dev/HobbyCollection/Backend/HobbyCollection.Domain/obj/Debug/net8.0/HobbyCollection.Domain.csproj.CoreCompileInputs.cache
+/Users/gokhanmemik/Dev/HobbyCollection/Backend/HobbyCollection.Domain/obj/Debug/net8.0/HobbyCollection.Domain.sourcelink.json
+/Users/gokhanmemik/Dev/HobbyCollection/Backend/HobbyCollection.Domain/obj/Debug/net8.0/HobbyCollection.Domain.dll
+/Users/gokhanmemik/Dev/HobbyCollection/Backend/HobbyCollection.Domain/obj/Debug/net8.0/refint/HobbyCollection.Domain.dll
+/Users/gokhanmemik/Dev/HobbyCollection/Backend/HobbyCollection.Domain/obj/Debug/net8.0/HobbyCollection.Domain.pdb
+/Users/gokhanmemik/Dev/HobbyCollection/Backend/HobbyCollection.Domain/obj/Debug/net8.0/ref/HobbyCollection.Domain.dll

@@ -1,0 +1,3 @@
+﻿<Project>
+  <Import Project="../buildMultiTargeting/HobbyCollection.Api.props" />
+</Project>

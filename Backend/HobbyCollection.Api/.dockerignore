@@ -1,0 +1,18 @@
+**/.git
+**/.vs
+**/.vscode
+**/bin
+**/obj
+**/node_modules
+**/.DS_Store
+**/test-images
+**/*.http
+**/*.backup
+**/Database/*.db-shm
+**/Database/*.db-wal
+# Database dahil edilecek
+# **/Database/*.db
+*.md
+README.md
+.gitignore
+

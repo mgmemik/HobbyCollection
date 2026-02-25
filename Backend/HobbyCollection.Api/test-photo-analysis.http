@@ -1,0 +1,25 @@
+### Fotoğraf Analizi API Test Dosyası
+
+### 1. Servis bilgilerini al
+GET http://localhost:5000/api/photoanalysis/info
+
+### 2. Sağlık kontrolü
+GET http://localhost:5000/api/photoanalysis/health
+
+### 3. Fotoğraf analizi (örnek - dosya yolu güncellenecek)
+POST http://localhost:5000/api/photoanalysis/analyze
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
+
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="photos"; filename="test-image.jpg"
+Content-Type: image/jpeg
+
+< ./test-images/sample.jpg
+------WebKitFormBoundary7MA4YWxkTrZu0gW--
+
+### Not: Bu test dosyasını kullanmak için:
+### 1. Google Cloud'da proje oluşturun
+### 2. Vision API'yi aktifleştirin  
+### 3. Service Account oluşturup JSON key indirin
+### 4. GOOGLE_APPLICATION_CREDENTIALS environment variable'ını ayarlayın
+### 5. test-images klasörüne örnek fotoğraflar ekleyin

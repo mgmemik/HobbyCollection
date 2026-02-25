@@ -1,0 +1,14 @@
+.env
+Database/*.db
+Database/*.sqlite
+**/node_modules
+**/.expo
+**/.next
+**/dist
+**/build
+**/*.log
+**/.DS_Store
+.jwt_key
+**/.jwt_key
+.git.backup
+*.zip
